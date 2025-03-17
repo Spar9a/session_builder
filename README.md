@@ -7,7 +7,7 @@ This project implements a data processing pipeline for IDE session tracking with
 ```
 ├── docker_mvp/                # Minimal viable product implementation using Docker
 │   ├── data_faker/            # Generates synthetic IDE usage data
-│   └── session_processor/     # Processes raw data into user sessions
+│   └── session_processor/     # Processes raw data with Apache Spark and assing user sessions
 │
 ├── iaac/                      # Infrastructure as Code for AWS deployment
 │   ├── environments/          # Environment-specific configurations
