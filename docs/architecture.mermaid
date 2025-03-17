@@ -1,0 +1,46 @@
+flowchart TD
+    subgraph Storage["Storage Layer"]
+        InputBucket[S3 Input Bucket\nRaw Parquet Files]
+        ProcessedBucket[S3 Processed Bucket\nDelta Lake Format]
+        CodeBucket[S3 Code Bucket\nSpark Scripts]
+    end
+    
+    subgraph Compute["Compute Layer"]
+        EC2ASG[EC2 with Spark\nManually Configured]
+        EC2ASG -->|Reads| InputBucket
+        EC2ASG -->|Writes| ProcessedBucket
+        EC2ASG -->|Downloads| CodeBucket
+    end
+    
+    subgraph Orchestration["Orchestration Layer"]
+        EventBridge[EventBridge\nScheduled Trigger]
+        StepFunctions[Step Functions\nWorkflow]
+        Lambda[Lambda Functions\nFor Coordination]
+        EventBridge -->|Triggers| StepFunctions
+        StepFunctions -->|Invokes| Lambda
+        Lambda -->|Starts/Monitors| EC2ASG
+    end
+    
+    subgraph Monitoring["Monitoring Layer"]
+        CloudWatch[CloudWatch\nMetrics & Alarms]
+        CloudTrail[CloudTrail\nAPI Logging]
+        EC2ASG -->|Emits| CloudWatch
+        EC2ASG -.->|Audits| CloudTrail
+    end
+    
+    subgraph Security["Security Layer"]
+        IAM[IAM Roles & Policies]
+        SSM[Systems Manager\nParameter Store]
+        EC2ASG -->|Assumes| IAM
+        EC2ASG -->|Retrieves Configs| SSM
+    end
+    
+    subgraph Network["Network Layer"]
+        VPC[VPC]
+        PrivateSubnets[Private Subnets]
+        VPCEndpoints[VPC Endpoints]
+        EC2ASG -->|Runs in| PrivateSubnets
+        PrivateSubnets -->|Part of| VPC
+        VPCEndpoints -->|Connects to| S3
+        VPC -->|Contains| VPCEndpoints
+    end

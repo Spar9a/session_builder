@@ -1,0 +1,4 @@
+faker
+polars
+fsspec
+s3fs

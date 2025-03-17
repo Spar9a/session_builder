@@ -1,0 +1,22 @@
+flowchart TD
+    Start([New events received]) --> CheckExisting{Existing sessions?}
+    CheckExisting -->|No| AssignNew[Assign new session IDs]
+    CheckExisting -->|Yes| GetExistingBounds[Get time bounds of existing sessions]
+    GetExistingBounds --> GetNewBounds[Get time bounds of new sessions]
+    GetNewBounds --> Compare{Compare sessions}
+    
+    Compare -->|New session extends existing| UseExistingID[Use existing session ID]
+    Compare -->|New session precedes existing| UpdateExistingID[Update existing with new session ID]
+    Compare -->|No overlap| KeepNew[Keep new session ID]
+    
+    UseExistingID --> MergeResults[Merge results]
+    UpdateExistingID --> MergeResults
+    KeepNew --> MergeResults
+    
+    MergeResults --> WriteNew[Write new data]
+    MergeResults --> UpdateExisting[Update existing data if needed]
+    
+    AssignNew --> WriteData[Write to Delta Lake]
+    WriteNew --> WriteData
+    UpdateExisting --> Finish([Finish])
+    WriteData --> Finish

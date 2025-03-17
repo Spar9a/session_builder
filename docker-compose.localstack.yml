@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  localstack:
+    container_name: localstack
+    image: localstack/localstack:4.2.0
+    ports:
+      - "0.0.0.0:4566:4566"            # LocalStack Gateway
+      - "0.0.0.0:4510-4559:4510-4559"  # external services port range
+    environment:
+      - DEBUG=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AWS_ACCESS_KEY_ID="test"
+      - AWS_SECRET_ACCESS_KEY="test"
+      - EC2_DOWNLOAD_DEFAULT_IMAGE=1
+      - EC2_EBS_MAX_VOLUME_SIZE=1000000
+      - EC2_MOUNT_BLOCK_DEVICES=1
+    volumes:
+      - "./docker_mount/localstack:/var/lib/localstack"
+      - "/Users/aksimemor/.orbstack/run/docker.sock:/var/run/docker.sock"

@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  data-faker:
+    build:
+      context: ./docker_mvp/data_faker
+    container_name: data-faker
+    environment:
+      - NUM_USERS=100
+      - ROWS_PER_FILE=1000
+      - NUM_FILES_PER_DAY=3
+      - NUM_API_DAYS=10
+      - MAX_DAYS_BACKWARD=5
+      - DATA_LAKE_BUCKET=/data
+      - RAW_DATA_FOLDER=raw-data
+      - CONTINUOUS_MODE=False
+    volumes:
+      - ./docker_mount/docker_mvp_data:/data
+
+  session-processor:
+    build:
+      context: ./docker_mvp/session_processor
+    container_name: session-processor
+    depends_on:
+      - data-faker
+    environment:
+      - DATA_LAKE_BUCKET=/data
+      - RAW_DATA_FOLDER=raw-data
+      - PROCESSED_DATA_FOLDER=processed-data
+      - DELTALAKE_TABLE_FOLDER=deltalake-table
+      - CONTINUOUS_MODE=False
+    volumes:
+      - ./docker_mount/docker_mvp_data:/data
+
+volumes:
+  data:
+    driver: local

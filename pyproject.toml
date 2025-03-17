@@ -1,0 +1,31 @@
+[project]
+name = "data-office"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "boto3>=1.37.9",
+    "delta-spark>=3.3.0",
+    "faker>=37.0.0",
+    "localstack>=4.2.0",
+    "pandas>=2.2.3",
+    "pip>=25.0.1",
+    "polars>=1.24.0",
+    "pyarrow>=19.0.1",
+    "pyspark>=3.5.5",
+]
+
+[dependency-groups]
+dev = [
+    "duckdb>=1.2.1",
+    "jupyter>=1.1.1",
+    "localstack>=4.2.0",
+    "polars>=1.24.0",
+    "pyspark>=3.5.5",
+    "terraform-local>=0.20.1",
+    "notebook>=7.3.3",
+    "terraform-local>=0.20.1",
+    "awscli>=1.38.13",
+    "awscli-local>=0.22.0",
+]
