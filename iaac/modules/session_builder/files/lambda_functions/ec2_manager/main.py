@@ -1,4 +1,6 @@
 import json
+from typing import Dict, Any
+
 import boto3
 import os
 import logging
@@ -9,7 +11,7 @@ logger.setLevel(logging.INFO)
 
 # Environment variables
 
-def start_ec2(event, context):
+def start_ec2(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Start EC2 instances for Spark processing
     """
@@ -56,7 +58,7 @@ def start_ec2(event, context):
         logger.error(f"Error starting EC2 instances: {str(e)}")
         raise e
 
-def check_status(event, context):
+def check_status(event, context) -> Dict[str, Any]:
     """
     Check if data processing is complete
     """
@@ -101,7 +103,7 @@ def check_status(event, context):
         logger.error(f"Error checking processing status: {str(e)}")
         raise e
 
-def stop_ec2(event, context):
+def stop_ec2(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Stop EC2 instances after Spark processing is complete
     """

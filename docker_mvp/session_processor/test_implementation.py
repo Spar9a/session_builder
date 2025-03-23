@@ -1,15 +1,21 @@
-import unittest
-from pyspark.sql.functions import col, to_timestamp
+from __future__ import annotations
 
+from pyspark.sql.functions import col, to_timestamp
 from spark_session_builder import (
     USER_EVENT_IDS,
     reconcile_sessions,
     identify_sessions,
     create_spark_session
 )
+from typing import TYPE_CHECKING
+
+import unittest
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
 
 
-def create_test_data(spark):
+def create_test_data(spark: SparkSession) -> tuple[DataFrame, DataFrame]:
     """Create synthetic data for testing reconciliation logic"""
     # Sample existing sessions
     existing_data = spark.createDataFrame([
@@ -67,15 +73,15 @@ def create_test_data(spark):
 class TestReconciliation(unittest.TestCase):
 
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         cls.spark = create_spark_session()
 
     @classmethod
-    def tearDownClass(cls):
+    def tearDownClass(cls) -> None:
         cls.spark.stop()
 
 
-    def test_reconciliation(self):
+    def test_reconciliation(self) -> None:
         """Test the reconciliation logic with synthetic data"""
         existing_data, new_data = create_test_data(self.spark)
 
@@ -109,7 +115,7 @@ class TestReconciliation(unittest.TestCase):
 
         print("All validation tests passed!")
 
-    def test_session_extension(self):
+    def test_session_extension(self) -> None:
         """Test that a new event within timeout extends an existing session"""
         # Create existing data
         existing_data = self.spark.createDataFrame([
@@ -127,7 +133,12 @@ class TestReconciliation(unittest.TestCase):
 
         # Create new data within timeout
         new_data = self.spark.createDataFrame([
+            ("user1", "a", "2025-03-10 10:03:20", "productA"),
+            ("user1", "h", "2025-03-10 10:03:30", "productA"),
+            ("user1", "h", "2025-03-10 10:03:35", "productA"),
             ("user1", "c", "2025-03-10 10:04:30", "productA"),
+            ("user1", "c", "2025-03-10 10:14:30", "productA"),
+            ("user1", "h", "2025-03-10 10:43:37", "productA"),
         ], ["user_id", "event_id", "timestamp", "product_code"])
 
         new_data = new_data.withColumn(
@@ -138,10 +149,29 @@ class TestReconciliation(unittest.TestCase):
         new_sessions = identify_sessions(new_data)
         result = reconcile_sessions(new_sessions, existing_data)
 
-        # Check if the new event got the same session ID
+        # Check if the new user event got the same session ID
         session_id = result.filter(
             (col("user_id") == "user1") &
             (col("timestamp") == "2025-03-10 10:04:30")
         ).select("session_id").collect()[0][0]
 
         self.assertEqual("user1#productA#1710060000", session_id)
+        print("✅ Case 1 passed: New user event got the same session ID as existing event")
+
+        # Check if the new system event got the same session ID
+        session_id = result.filter(
+            (col("user_id") == "user1") &
+            (col("timestamp") == "2025-03-10 10:03:30")
+        ).select("session_id").collect()[0][0]
+
+        self.assertEqual("user1#productA#1710060000", session_id)
+        print("✅ Case 2 passed: New system event got the same session ID based on time diff from existing user event")
+
+        # Check if the new system event got the same session ID
+        session_id = result.filter(
+            (col("user_id") == "user1") &
+            (col("timestamp") == "2025-03-10 10:43:37")
+        ).select("session_id").collect()[0][0]
+
+        self.assertEqual(None, session_id)
+        print("✅ Case 3 passed: New system event got None as session ID based on time diff from prev existing user event")

@@ -1,8 +1,10 @@
 import json
+from typing import Dict, Any
+
 import boto3
 import os
 
-def lambda_handler(event, context):
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Get environment variables
     data_lake_bucket = os.environ.get('DATA_LAKE_BUCKET')
     raw_data_path = os.environ.get('PROCESSED_FOLDER', 'raw-zone')

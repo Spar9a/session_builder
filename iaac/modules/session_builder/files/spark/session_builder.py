@@ -1,18 +1,22 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lag, when, lit, concat_ws, unix_timestamp, substring
-from pyspark.sql.window import Window
-from delta.tables import DeltaTable
-import datetime
-import os
-import argparse
+from __future__ import annotations
 
-# Initialize Spark Session with Delta Lake support
-spark = SparkSession.builder \
-    .appName("IDE Session Builder") \
-    .config("spark.jars.packages", "io.delta:delta-spark_2.12:3.3.0") \
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-    .getOrCreate()
+import argparse
+import logging
+import glob
+from typing import TYPE_CHECKING
+
+import boto3
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (col, collect_list, concat_ws, expr, lag,
+                                   last, last_value, lit)
+from pyspark.sql.functions import max as sql_max
+from pyspark.sql.functions import min as sql_min
+from pyspark.sql.functions import to_date, unix_timestamp, when
+from pyspark.sql.window import Window
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame
 
 # Define constants
 USER_EVENT_IDS = ['a', 'b', 'c']
@@ -20,7 +24,7 @@ SESSION_TIMEOUT_SECS = 5 * 60  # 5 minutes in seconds
 LOOKBACK_DAYS = 5
 
 # Parse command line arguments
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Process IDE session data')
     parser.add_argument('--data_lake_bucket', required=True, help='S3 bucket for data lake')
     parser.add_argument('--raw_data_folder', required=True, help='Folder for raw data')
@@ -28,8 +32,27 @@ def parse_args():
     parser.add_argument('--deltalake_folder', required=True, help='Folder for deltalake table')
     return parser.parse_args()
 
+
+def create_spark_session() -> SparkSession:
+    """Initialize and configure the Spark session with Delta Lake support."""
+    return (
+        SparkSession.builder
+        .appName("IDE Session Builder")
+        .config("spark.jars.packages", "io.delta:delta-spark_2.12:3.3.0")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.driver.memory", "4g")
+        .getOrCreate()
+    )
+
+
+logger = logging.getLogger()
+logger.setLevel("INFO")
+
 # Get arguments
 args = parse_args()
+
 DATA_LAKE_BUCKET = args.data_lake_bucket
 RAW_DATA_FOLDER = args.raw_data_folder
 PROCESSED_DATA_FOLDER = args.processed_data_folder
@@ -40,14 +63,14 @@ RAW_DATA_FOLDER_PATH = f"s3://{DATA_LAKE_BUCKET}/{RAW_DATA_FOLDER}"
 PROCESSED_DATA_FOLDER_PATH = f"s3://{DATA_LAKE_BUCKET}/{PROCESSED_DATA_FOLDER}"
 
 
-def read_new_files(spark):
+def read_new_files(spark: SparkSession) -> tuple[DataFrame, list[str]]:
     """Read new Parquet files from the input directory"""
     # List all parquet files in the raw data folder
     file_pattern = f"{RAW_DATA_FOLDER_PATH}/*.parquet"
     file_paths = glob.glob(file_pattern)
 
     if not file_paths:
-        print("No new files found")
+        logger.warning("No new files found")
         return None
 
     # Read all parquet files using Spark
@@ -62,7 +85,7 @@ def read_new_files(spark):
     return processed_data, file_paths
 
 
-def identify_sessions(events_df):
+def identify_sessions(events_df: DataFrame) -> DataFrame:
     """
     Identify user sessions based on user activity and inactivity periods.
 
@@ -77,30 +100,41 @@ def identify_sessions(events_df):
         "is_user_event", col("event_id").isin(USER_EVENT_IDS)
     )
 
-    # Create window spec for session analysis, partitioned by user and product
+    events_with_flags = events_with_flags.withColumn(
+        "user_event_flag",
+        when(col("is_user_event") == True, col("timestamp")).otherwise(None)
+    )
+
+
+    # Window for looking back to find the most recent user event
     window_spec = Window.partitionBy("user_id", "product_code").orderBy("timestamp")
 
-    # Calculate time difference between consecutive events and previous event type
     events_with_diffs = events_with_flags.withColumn(
-        "prev_timestamp", lag("timestamp").over(window_spec)
-    ).withColumn(
-        "prev_is_user_event", lag("is_user_event").over(window_spec)
+        "last_user_event_ts",
+        last_value("user_event_flag", ignoreNulls=True).over(
+            window_spec.rangeBetween(Window.unboundedPreceding, 0)
+        )
+    )
+
+    # Now get the previous user event timestamp by using a lag on this column
+    events_with_diffs = events_with_diffs.withColumn(
+        "prev_user_ts",
+        lag("last_user_event_ts", 1, None).over(window_spec)
     ).withColumn(
         "time_diff_seconds",
-        when(col("prev_timestamp").isNotNull(),
-             unix_timestamp(col("timestamp")) - unix_timestamp(col("prev_timestamp")))
+        when(col("prev_user_ts").isNotNull(),
+             unix_timestamp(col("timestamp")) - unix_timestamp(col("prev_user_ts")))
         .otherwise(0)
-    )
+    ).drop("user_event_flag", "last_user_event_ts")
+
 
     # Determine session boundaries based on rules:
     # 1. First event for user+product (if it's a user event)
     # 2. User event after inactivity period > 5 minutes
-    # 3. User event after an IDE event (non-user event)
     sessions_df = events_with_diffs.withColumn(
         "is_new_session",
-        ((col("prev_timestamp").isNull()) & col("is_user_event")) |  # First event must be user event
-        ((col("time_diff_seconds") > SESSION_TIMEOUT_SECS) & col("is_user_event")) |  # Timeout
-        (col("is_user_event") & (col("prev_is_user_event") == False))  # User event after IDE event
+        ((col("prev_user_ts").isNull()) & col("is_user_event")) |  # First event must be user event
+        ((col("time_diff_seconds") > SESSION_TIMEOUT_SECS) & col("is_user_event"))  # Timeout
     )
 
     # Window for assigning session start times across the session
@@ -138,12 +172,13 @@ def identify_sessions(events_df):
     return final_sessions.select("user_id", "product_code", "event_id", "timestamp", "session_id", "event_date")
 
 
-def get_session_boundaries(sessions_df, prefix: str):
+def get_session_boundaries(sessions_df: DataFrame, prefix: str) -> DataFrame:
     """
     Calculate the min and max timestamps for each session.
 
     Args:
         sessions_df: DataFrame with identified sessions
+        prefix: Prefix to use for column names
 
     Returns:
         DataFrame: Session boundaries with min/max timestamps
@@ -161,7 +196,7 @@ def get_session_boundaries(sessions_df, prefix: str):
     )
 
 
-def get_boundaries_by_product(new_user_sessions):
+def get_boundaries_by_product(new_user_sessions: DataFrame) -> str:
     """Get filter conditions based on product_code and date range with 1 day window back and forward"""
     # First, create a date column explicitly
     with_dates = new_user_sessions.withColumn("event_date", to_date(col("timestamp")))
@@ -200,19 +235,16 @@ def get_boundaries_by_product(new_user_sessions):
     if not filter_conditions:
         return lit(False)
 
-    # combined_filter = reduce(lambda a, b: a | b, filter_conditions, lit(False))
-
     return " or ".join(filter_conditions)
 
 
-def read_existing_sessions(spark, new_sessions):
+def read_existing_sessions(spark: SparkSession, new_sessions: DataFrame) -> DataFrame:
     """
     Read existing sessions that might overlap with new sessions.
 
     Args:
         spark: Spark session
-        processed_bucket: Bucket or path containing processed data
-        new_sessions_boundaries: Boundaries of new sessions
+        new_sessions: DataFrame with new sessions to filter processed data by
 
     Returns:
         DataFrame: Existing sessions that might overlap with new ones
@@ -225,9 +257,9 @@ def read_existing_sessions(spark, new_sessions):
 
         # Check if delta table exists
         try:
-            existing_data = DeltaTable.forPath(spark, f"{DATA_LAKE_BUCKET}/{PROCESSED_DATA_FOLDER}").toDF()
+            existing_data = DeltaTable.forPath(spark, PROCESSED_DATA_FOLDER_PATH).toDF()
         except Exception:
-            print("No existing processed data found")
+            logger.info("No existing processed data found")
             return spark.createDataFrame([], new_sessions.schema)
 
 
@@ -247,17 +279,17 @@ def read_existing_sessions(spark, new_sessions):
 
         # Count and return
         session_count = filtered_existing.select("session_id").distinct().count()
-        print(f"Found {session_count} existing sessions that might overlap")
+        logger.info(f"Found {session_count} existing sessions that might overlap")
 
         return filtered_existing
 
     except Exception as e:
-        print(f"Error reading existing sessions: {str(e)}")
+        logger.error(f"Error reading existing sessions: {str(e)}")
         # If no data exists or other error, return empty DataFrame
         return spark.createDataFrame([], new_sessions.schema)
 
 
-def reconcile_sessions(new_sessions, existing_sessions):
+def reconcile_sessions(new_sessions: DataFrame, existing_sessions: DataFrame) -> DataFrame:
     """
     Reconcile new sessions with existing ones to handle retroactive data.
     Returns a single DataFrame ready for a merge operation.
@@ -271,7 +303,7 @@ def reconcile_sessions(new_sessions, existing_sessions):
     """
     # If no existing sessions, just return new sessions with merge metadata
     if existing_sessions.count() == 0:
-        print("No existing sessions to reconcile with")
+        logger.info("No existing sessions to reconcile with")
         # Add a column to indicate these are all new records
         return new_sessions.withColumn("merge_action", lit("insert"))
 
@@ -425,19 +457,19 @@ def reconcile_sessions(new_sessions, existing_sessions):
 
         # Return the combined dataset
         mapping_count = affected_existing_sessions.count()
-        print(f"Reconciled {mapping_count} session ID updates")
+        logger.info(f"Reconciled {mapping_count} session ID updates")
         return final_data.select(
             "user_id", "product_code", "event_id", "timestamp", "session_id", "event_date"
         )
     else:
         # If no existing sessions need updates, just return the new data
-        print("No existing sessions need updates")
+        logger.info("No existing sessions need updates")
         return updated_new_data.select(
             "user_id", "product_code", "event_id", "timestamp", "session_id", "event_date"
         )
 
 
-def write_data_with_merge(spark, merged_data):
+def write_data_with_merge(spark: SparkSession, merged_data: DataFrame) -> None:
     """
     Write data to Delta table using merge operation.
 
@@ -472,10 +504,10 @@ def write_data_with_merge(spark, merged_data):
                 }
             ).execute()
 
-            print(f"Successfully merged data with Delta table")
+            logger.info("Successfully merged data with Delta table")
 
         except Exception as e:
-            print(f"Delta table doesn't exist yet, creating: {str(e)}")
+            logger.warning(f"Delta table doesn't exist yet, creating: {str(e)}")
 
             # Drop the merge_action column for initial write
             initial_data = merged_data.drop("merge_action")
@@ -486,13 +518,13 @@ def write_data_with_merge(spark, merged_data):
                 .mode("append") \
                 .save(DELTA_TABLE_PATH)
 
-            print(f"Created new Delta table with {initial_data.count()} records")
+            logger.info(f"Created new Delta table with {initial_data.count()} records")
 
     except Exception as e:
-        print(f"Error writing data: {str(e)}")
+        logger.error(f"Error writing data: {str(e)}")
         raise
 
-def move_files(files):
+def move_files(files: list[str]):
     """
     Move processed files from the raw data folder.
     Args:
@@ -506,17 +538,17 @@ def move_files(files):
             s3.copy_object(
                 Bucket=DATA_LAKE_BUCKET,
                 CopySource={'Bucket': DATA_LAKE_BUCKET, 'Key': object_key},
-                Key=f"{PROCESSED_FOLDER}/{object_key.split('/')[-1]}"
+                Key=f"{PROCESSED_DATA_FOLDER_PATH}/{object_key.split('/')[-1]}"
             )
             # Delete the file from the raw folder
             s3.delete_object(Bucket=DATA_LAKE_BUCKET, Key=object_key)
 
-        print(f"Successfully moved {len(files)} files")
+        logger.info(f"Successfully moved {len(files)} files")
     except Exception as e:
-        print(f"Error moving files: {str(e)}")
+        logger.error(f"Error moving files: {str(e)}")
         raise
 
-def main():
+def main() -> None:
     """Main session builder pipeline."""
 
     # Set processing date
@@ -529,39 +561,39 @@ def main():
         new_data, files = read_new_files(spark)
 
         # 2. Identify sessions within the new data
-        print("Identifying sessions in new data...")
+        logger.info("Identifying sessions in new data...")
         sessions = identify_sessions(new_data)
 
         # 4. Read existing sessions that might need reconciliation
-        print("Reading existing processed data...")
+        logger.info("Reading existing processed data...")
         existing_sessions = read_existing_sessions(
             spark, sessions
         )
 
         # 5. Reconcile with existing sessions
-        print("Reconciling with existing sessions...")
+        logger.info("Reconciling with existing sessions...")
         merged_data = reconcile_sessions(sessions, existing_sessions)
 
         # Use a single merge operation to write data
-        print("Writing data using merge operation...")
+        logger.info("Writing data using merge operation...")
         write_data_with_merge(spark, merged_data)
 
         # 8. Log statistics
         sessions_count = merged_data.select("session_id").distinct().count()
         events_count = merged_data.count()
 
-        print(f"=== Session Builder Summary ===")
-        print(f"Processed {events_count} events")
-        print(f"Identified {sessions_count} sessions")
+        logger.info("=== Session Builder Summary ===")
+        logger.info(f"Processed {events_count} events")
+        logger.info(f"Identified {sessions_count} sessions")
 
         move_files(files=files)
 
-        print("=== Processing complete ===")
+        logger.info("=== Processing complete ===")
 
     except Exception as e:
-        print(f"Error in session builder pipeline: {str(e)}")
+        logger.error(f"Error in session builder pipeline: {str(e)}")
         raise
 
 # Execute the pipeline
 if __name__ == "__main__":
-    run_session_builder()
+    main()
