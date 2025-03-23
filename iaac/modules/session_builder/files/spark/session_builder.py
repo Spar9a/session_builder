@@ -199,7 +199,7 @@ def get_session_boundaries(sessions_df: DataFrame, prefix: str) -> DataFrame:
 def get_boundaries_by_product(new_user_sessions: DataFrame) -> str:
     """Get filter conditions based on product_code and date range with 1 day window back and forward"""
     # First, create a date column explicitly
-    with_dates = new_user_sessions.withColumn("event_date", to_date(col("timestamp")))
+    with_dates = new_user_sessions.withColumn("event_date", to_date(col("timestamp"))).cache()
 
     # Now use the explicitly created column
     dates_by_product = with_dates.select(
@@ -208,6 +208,8 @@ def get_boundaries_by_product(new_user_sessions: DataFrame) -> str:
     ).distinct().groupBy("product_code").agg(
         collect_list("event_date").alias("dates")
     )
+
+    with_dates.unpersist()
 
     expanded_dates = dates_by_product.withColumn(
         "expanded_dates",
@@ -379,35 +381,48 @@ def reconcile_sessions(new_sessions: DataFrame, existing_sessions: DataFrame) ->
         col("new.user_id").alias("user_id"),
         col("new.product_code").alias("product_code"),
         col("new_session_id").alias("original_session_id"),
+        col("existing_session_min_time").alias("existing_session_min_time"),
+        col("new_session_max_time").alias("new_session_max_time"),
         col("final_session_id")
-    ).filter(col("new_session_id") != col("final_session_id"))
+    ).filter(col("new_session_id") != col("final_session_id")).cache()
 
     # Extract all affected existing sessions that need updating
     affected_existing_sessions = reconciled.filter(
-        (col("existing_session_id") != col("final_session_id")) &
-        col("existing_session_id").isNotNull()
+        (col("existing_session_id") != col("final_session_id"))
     ).select(
         col("existing.user_id").alias("user_id"),
         col("existing.product_code").alias("product_code"),
         col("existing_session_id").alias("original_session_id"),
         col("final_session_id")
-    )
+    ).cache()
+
+    new_mapping = new_mapping.repartitionByRange("user_id", "product_code")
+    new_sessions = new_sessions.repartitionByRange("user_id", "product_code")
 
     # Join new mappings back to the new data to update session IDs
     updated_new_data = new_sessions.join(
         new_mapping,
         (new_sessions["user_id"] == new_mapping["user_id"]) &
         (new_sessions["product_code"] == new_mapping["product_code"]) &
-        (new_sessions["session_id"] == new_mapping["original_session_id"]),
+        ((new_sessions["session_id"] == new_mapping["original_session_id"]) |
+         (
+                 new_sessions["session_id"].isNull() &
+                 (new_sessions['timestamp'] >= new_mapping["existing_session_min_time"]) &
+                 (new_sessions['timestamp'] <= new_mapping["new_session_max_time"])
+         )
+         ),
         how="left"
     ).withColumn(
         "session_id",
         when(col("final_session_id").isNotNull(), col("final_session_id"))
         .otherwise(col("session_id"))
     ).drop(
-        new_mapping["user_id"], new_mapping["product_code"],
+        new_mapping["user_id"], new_mapping["product_code"], new_mapping["existing_session_min_time"],
+        new_mapping["new_session_max_time"],
         "original_session_id", "final_session_id"
     )
+
+    new_mapping.unpersist()
 
     # Add merge_action column to indicate these are inserts
     updated_new_data = updated_new_data.withColumn("merge_action", lit("insert"))
@@ -457,6 +472,9 @@ def reconcile_sessions(new_sessions: DataFrame, existing_sessions: DataFrame) ->
 
         # Return the combined dataset
         mapping_count = affected_existing_sessions.count()
+
+        affected_existing_sessions.unpersist()
+
         logger.info(f"Reconciled {mapping_count} session ID updates")
         return final_data.select(
             "user_id", "product_code", "event_id", "timestamp", "session_id", "event_date"
@@ -573,6 +591,8 @@ def main() -> None:
         # 5. Reconcile with existing sessions
         logger.info("Reconciling with existing sessions...")
         merged_data = reconcile_sessions(sessions, existing_sessions)
+
+        existing_sessions.unpersist()
 
         # Use a single merge operation to write data
         logger.info("Writing data using merge operation...")
